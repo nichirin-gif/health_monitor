@@ -1,8 +1,11 @@
 import socket
 import json
 import heapq
+import itertools
 import threading
 import time
+import urllib.request
+import urllib.error
 
 HOST = "0.0.0.0"
 PORT = 5000
@@ -15,17 +18,42 @@ MEMORY_CRITICAL = 90
 
 FAILURE_TIMEOUT = 12
 
+CONTROLLER_URL = "http://127.0.0.1:8080/notify"
+CONTROLLER_TIMEOUT = 0.5
+
 server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 server.bind((HOST, PORT))
 
 priority_queue = []
 queue_lock = threading.Lock()
+# heapq falls back to comparing the next tuple element on a tie; a
+# monotonically increasing counter breaks (priority, timestamp) ties
+# before heapq ever has to compare the health dict.
+_seq = itertools.count()
 
 last_seen = {}
+node_ip = {}
 failed_nodes = set()
+critical_nodes = set()
 node_lock = threading.Lock()
 
 print(f"Monitoring server listening on UDP port {PORT}...")
+
+
+def notify_controller(ip, condition):
+    """Best-effort notification to the Ryu SDN controller. The UDP
+    health-monitoring loop must keep working even if the controller
+    or its REST API is unreachable."""
+    payload = json.dumps({"ip": ip, "condition": condition}).encode()
+    request = urllib.request.Request(
+        CONTROLLER_URL, data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=CONTROLLER_TIMEOUT)
+    except (urllib.error.URLError, OSError):
+        pass
 
 
 def receive_reports():
@@ -37,13 +65,19 @@ def receive_reports():
         node = health["node"]
         cpu = health["cpu"]
         memory = health["memory"]
+        ip = address[0]
 
         with node_lock:
             last_seen[node] = time.time()
 
+            if node not in node_ip:
+                node_ip[node] = ip
+                notify_controller(ip, "REGISTER")
+
             if node in failed_nodes:
                 failed_nodes.remove(node)
                 print(f"RECOVERED: {node} is sending reports again")
+                notify_controller(ip, "RECOVERED_FAILURE")
 
         if cpu >= CPU_CRITICAL or memory >= MEMORY_CRITICAL:
             priority = 0
@@ -55,10 +89,18 @@ def receive_reports():
             priority = 2
             priority_name = "NORMAL"
 
+        with node_lock:
+            if priority_name == "CRITICAL" and node not in critical_nodes:
+                critical_nodes.add(node)
+                notify_controller(ip, "CRITICAL")
+            elif priority_name != "CRITICAL" and node in critical_nodes:
+                critical_nodes.remove(node)
+                notify_controller(ip, "RECOVERED_CRITICAL")
+
         with queue_lock:
             heapq.heappush(
                 priority_queue,
-                (priority, health["timestamp"], health, priority_name)
+                (priority, health["timestamp"], next(_seq), health, priority_name)
             )
 
         print(f"Received {priority_name} report from {node}")
@@ -70,7 +112,7 @@ def process_reports():
 
         with queue_lock:
             if priority_queue:
-                _, _, report, report_priority = heapq.heappop(priority_queue)
+                _, _, _, report, report_priority = heapq.heappop(priority_queue)
             else:
                 report = None
 
@@ -98,6 +140,9 @@ def check_failures():
                     if node not in failed_nodes:
                         failed_nodes.add(node)
                         print(f"🚨 FAILURE DETECTED: {node} is not responding")
+                        ip = node_ip.get(node)
+                        if ip:
+                            notify_controller(ip, "FAILURE")
 
 
 receiver_thread = threading.Thread(target=receive_reports)
