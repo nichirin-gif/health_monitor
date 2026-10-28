@@ -30,7 +30,12 @@ while True:
 
     message = json.dumps(health)
 
-    client.sendto(message.encode(), (SERVER_IP, SERVER_PORT))
+    try:
+        client.sendto(message.encode(), (SERVER_IP, SERVER_PORT))
+    except OSError as exc:
+        print("Send failed; will retry:", exc)
+        time.sleep(2)
+        continue
 
     print(f"Sent: {message}")
 

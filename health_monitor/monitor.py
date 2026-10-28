@@ -1,4 +1,5 @@
 import socket
+import queue
 import json
 import heapq
 import itertools
@@ -18,7 +19,7 @@ MEMORY_CRITICAL = 90
 
 FAILURE_TIMEOUT = 12
 
-CONTROLLER_URL = "http://127.0.0.1:8080/notify"
+CONTROLLER_URL = "http://10.0.0.254:8080/notify"
 CONTROLLER_TIMEOUT = 0.5
 
 server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -40,7 +41,16 @@ node_lock = threading.Lock()
 print(f"Monitoring server listening on UDP port {PORT}...")
 
 
+controller_events = queue.Queue()
+
 def notify_controller(ip, condition):
+    controller_events.put((ip, condition))
+
+def controller_worker():
+    while True:
+        _send_notification(*controller_events.get())
+
+def _send_notification(ip, condition):
     """Best-effort notification to the Ryu SDN controller. The UDP
     health-monitoring loop must keep working even if the controller
     or its REST API is unreachable."""
@@ -51,16 +61,25 @@ def notify_controller(ip, condition):
         method="POST",
     )
     try:
-        urllib.request.urlopen(request, timeout=CONTROLLER_TIMEOUT)
-    except (urllib.error.URLError, OSError):
-        pass
+        with urllib.request.urlopen(request, timeout=CONTROLLER_TIMEOUT):
+            pass
+    except (urllib.error.URLError, OSError) as exc:
+        print("Controller notification failed:", condition, ip, exc)
 
 
 def receive_reports():
     while True:
         data, address = server.recvfrom(4096)
 
-        health = json.loads(data.decode())
+        try:
+            health = json.loads(data.decode())
+            assert isinstance(health, dict)
+            assert isinstance(health["node"], str) and health["node"]
+            assert all(isinstance(health[k], (int, float))
+                       for k in ("cpu", "memory", "timestamp"))
+        except (ValueError, KeyError, TypeError, AssertionError):
+            print("Ignored invalid report from", address)
+            continue
 
         node = health["node"]
         cpu = health["cpu"]
@@ -108,7 +127,7 @@ def receive_reports():
 
 def process_reports():
     while True:
-        time.sleep(3)
+        time.sleep(0.05)
 
         with queue_lock:
             if priority_queue:
@@ -149,6 +168,7 @@ receiver_thread = threading.Thread(target=receive_reports)
 processor_thread = threading.Thread(target=process_reports)
 failure_thread = threading.Thread(target=check_failures)
 
+threading.Thread(target=controller_worker, daemon=True).start()
 receiver_thread.start()
 processor_thread.start()
 failure_thread.start()
